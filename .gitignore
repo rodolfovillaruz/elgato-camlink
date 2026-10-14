@@ -1,0 +1,6 @@
+# MediaMTX is downloaded on first run
+/mediamtx/
+# Runtime files written by MediaMTX
+/mediamtx.log
+/auto.crt
+/auto.key

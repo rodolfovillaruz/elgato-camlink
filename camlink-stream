@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Stream an Elgato Cam Link over network streaming protocols.
+#
+#   camlink-stream serve           Local server: RTSP, RTMP, SRT, HLS and WebRTC at once (via MediaMTX)
+#   camlink-stream push <url>      Push to a remote ingest: rtmp://, rtmps://, srt://
+#
+# Options (before or after the mode):
+#   --device /dev/videoN   Video device (default: auto-detect "Cam Link")
+#   --size WxH             Capture size (default: whatever the HDMI source sends)
+#   --fps N                Capture frame rate (default: whatever the HDMI source sends)
+#   --bitrate N            Video bitrate, e.g. 6M (default: 6M)
+#   --encoder NAME         h264_nvenc | h264_vaapi | libx264 (default: first that works)
+#   --no-audio             Skip the Cam Link's audio input
+#   --test                 Use a synthetic test pattern instead of the Cam Link
+#   --path NAME            Stream path on the local server (default: camlink)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+MEDIAMTX="$HERE/mediamtx/mediamtx"
+MEDIAMTX_CONF="$HERE/mediamtx/mediamtx.yml"
+MEDIAMTX_VERSION="v1.21.2"
+
+RTMP_PORT="${RTMP_PORT:-1936}"  # 1935 is taken by the Restreamer container
+MODE="" URL="" DEVICE="" SIZE="" FPS="" BITRATE="6M"
+ENCODER="" AUDIO=1 TEST=0 STREAM_PATH="camlink"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    serve) MODE=serve ;;
+    push) MODE=push; URL="${2:-}"; shift ;;
+    --device) DEVICE="$2"; shift ;;
+    --size) SIZE="$2"; shift ;;
+    --fps) FPS="$2"; shift ;;
+    --bitrate) BITRATE="$2"; shift ;;
+    --encoder) ENCODER="$2"; shift ;;
+    --no-audio) AUDIO=0 ;;
+    --test) TEST=1 ;;
+    --path) STREAM_PATH="$2"; shift ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+[ -n "$MODE" ] || die "choose a mode: serve | push <url> (see --help)"
+[ "$MODE" != push ] || [ -n "$URL" ] || die "push needs a URL, e.g. push rtmp://live.twitch.tv/app/<key>"
+
+# --- Locate the Cam Link ----------------------------------------------------
+
+find_video_device() {
+  # The first /dev/videoN listed under the "Cam Link" entry is the capture node.
+  v4l2-ctl --list-devices 2>/dev/null |
+    awk '/Cam Link/ {found=1; next} found && /\/dev\/video/ {print $1; exit} /^$/ {found=0}'
+}
+
+find_alsa_card() {
+  # /proc/asound/cards lines look like: " 3 [Link4K         ]: USB-Audio - Cam Link 4K"
+  awk -F'[][]' '/Cam Link/ {gsub(/ /, "", $2); print $2; exit}' /proc/asound/cards 2>/dev/null
+}
+
+device_mode() {
+  # The Cam Link only advertises the mode its HDMI input is currently sending.
+  # Prints "WxH fps", e.g. "1920x1080 59.940".
+  v4l2-ctl -d "$1" --list-formats-ext 2>/dev/null | awk '
+    /Size: Discrete/ && !size {size=$3}
+    /Interval: Discrete/ && !fps {gsub(/[()]/, "", $4); fps=$4}
+    END {if (size && fps) print size, fps}'
+}
+
+ffmpeg_rate() {
+  # NTSC rates as exact fractions so v4l2 and the encoder agree.
+  case "$1" in
+    59.94*) echo 60000/1001 ;;
+    29.97*) echo 30000/1001 ;;
+    23.97*|23.976*) echo 24000/1001 ;;
+    *) echo "$1" ;;
+  esac
+}
+
+if [ "$TEST" = 1 ]; then
+  SIZE="${SIZE:-1920x1080}" FPS="${FPS:-30}"
+  VIDEO_IN=(-re -f lavfi -i "testsrc2=size=$SIZE:rate=$FPS")
+  AUDIO_IN=(-re -f lavfi -i "sine=frequency=440:sample_rate=48000")
+else
+  [ -n "$DEVICE" ] || DEVICE="$(find_video_device)"
+  if [ -z "$DEVICE" ]; then
+    die "Cam Link not found. Check that it is plugged into a USB 3 port and appears in 'v4l2-ctl --list-devices'.
+       If it still doesn't appear, see the Troubleshooting section in README.md."
+  fi
+  if [ -z "$SIZE" ] || [ -z "$FPS" ]; then
+    read -r DEV_SIZE DEV_FPS < <(device_mode "$DEVICE") || true
+    [ -n "${DEV_SIZE:-}" ] || die "could not read the capture mode of $DEVICE; pass --size and --fps"
+    SIZE="${SIZE:-$DEV_SIZE}" FPS="${FPS:-$DEV_FPS}"
+  fi
+  VIDEO_IN=(-f v4l2 -thread_queue_size 512 -video_size "$SIZE" -framerate "$(ffmpeg_rate "$FPS")" -i "$DEVICE")
+  AUDIO_IN=()
+  if [ "$AUDIO" = 1 ]; then
+    CARD="$(find_alsa_card)"
+    if [ -n "$CARD" ]; then
+      AUDIO_IN=(-f alsa -thread_queue_size 512 -ac 2 -ar 48000 -i "plughw:CARD=$CARD")
+    else
+      echo "note: no Cam Link audio device found, streaming video only" >&2
+      AUDIO=0
+    fi
+  fi
+fi
+
+# --- Pick an encoder --------------------------------------------------------
+
+encoder_works() {
+  local enc_args
+  case "$1" in
+    h264_vaapi) enc_args=(-vaapi_device /dev/dri/renderD128 -vf format=nv12,hwupload -c:v h264_vaapi) ;;
+    *) enc_args=(-c:v "$1") ;;
+  esac
+  ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=256x144:rate=30 -frames:v 5 \
+    "${enc_args[@]}" -f null - >/dev/null 2>&1
+}
+
+if [ -z "$ENCODER" ]; then
+  for e in h264_nvenc h264_vaapi libx264; do
+    if encoder_works "$e"; then ENCODER="$e"; break; fi
+  done
+  [ -n "$ENCODER" ] || die "no working H.264 encoder found"
+fi
+
+# Keyframe every second, no B-frames: low latency and WebRTC compatible.
+GOP="$(printf '%.0f' "$FPS")"
+case "$ENCODER" in
+  h264_nvenc)
+    VIDEO_ENC=(-pix_fmt yuv420p -c:v h264_nvenc -preset p4 -tune ll -rc cbr -b:v "$BITRATE"
+               -maxrate "$BITRATE" -bufsize "$BITRATE" -g "$GOP" -bf 0 -profile:v high) ;;
+  h264_vaapi)
+    VIDEO_ENC=(-vaapi_device /dev/dri/renderD128 -vf format=nv12,hwupload -c:v h264_vaapi
+               -rc_mode CBR -b:v "$BITRATE" -maxrate "$BITRATE" -g "$GOP" -bf 0) ;;
+  libx264)
+    VIDEO_ENC=(-pix_fmt yuv420p -c:v libx264 -preset veryfast -tune zerolatency -b:v "$BITRATE"
+               -maxrate "$BITRATE" -bufsize "$BITRATE" -g "$GOP" -bf 0) ;;
+  *)
+    VIDEO_ENC=(-pix_fmt yuv420p -c:v "$ENCODER" -b:v "$BITRATE" -g "$GOP" -bf 0) ;;
+esac
+
+# --- Output -----------------------------------------------------------------
+
+MAPS=(-map 0:v)
+if [ "$AUDIO" = 1 ]; then
+  MAPS+=(-map 1:a)
+  if [ "$MODE" = serve ]; then MAPS+=(-map 1:a); fi
+fi
+
+if [ "$MODE" = serve ]; then
+  if [ ! -x "$MEDIAMTX" ]; then
+    echo "Downloading MediaMTX $MEDIAMTX_VERSION..." >&2
+    mkdir -p "$HERE/mediamtx"
+    curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" |
+      tar xz -C "$HERE/mediamtx" || die "could not download MediaMTX"
+  fi
+  # Two audio tracks: Opus for WebRTC, AAC for RTMP; MediaMTX gives each reader what it supports.
+  AUDIO_ENC=(-c:a:0 libopus -b:a:0 128k -c:a:1 aac -b:a:1 160k -ar 48000)
+  OUT=(-f rtsp -rtsp_transport tcp "rtsp://127.0.0.1:8554/$STREAM_PATH")
+else
+  # Public ingests (Twitch, YouTube, ...) expect AAC.
+  AUDIO_ENC=(-c:a aac -b:a 160k -ar 48000)
+  case "$URL" in
+    rtmp://*|rtmps://*) OUT=(-f flv "$URL") ;;
+    srt://*) OUT=(-f mpegts "$URL") ;;
+    *) die "unsupported push URL (use rtmp://, rtmps:// or srt://): $URL" ;;
+  esac
+fi
+[ "$AUDIO" = 1 ] || AUDIO_ENC=()
+[ "$TEST" = 1 ] && [ "$AUDIO" = 0 ] && AUDIO_IN=()
+
+FFMPEG=(ffmpeg -hide_banner -loglevel warning -stats "${VIDEO_IN[@]}" "${AUDIO_IN[@]}"
+        "${MAPS[@]}" "${VIDEO_ENC[@]}" "${AUDIO_ENC[@]}" "${OUT[@]}")
+
+MTX_PID=""
+cleanup() { [ -n "$MTX_PID" ] && kill "$MTX_PID" 2>/dev/null; wait 2>/dev/null; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+if [ "$MODE" = serve ]; then
+  MTX_RTMPADDRESS=":$RTMP_PORT" "$MEDIAMTX" "$MEDIAMTX_CONF" > "$HERE/mediamtx.log" 2>&1 &
+  MTX_PID=$!
+  for _ in $(seq 50); do
+    (exec 3<>/dev/tcp/127.0.0.1/8554) 2>/dev/null && break
+    kill -0 "$MTX_PID" 2>/dev/null || die "MediaMTX failed to start, see $HERE/mediamtx.log"
+    sleep 0.1
+  done
+  HOST="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}')"
+  HOST="${HOST:-localhost}"
+  cat <<EOF
+Cam Link stream is live ($ENCODER, $SIZE@$FPS, $BITRATE):
+  RTSP    rtsp://$HOST:8554/$STREAM_PATH
+  RTMP    rtmp://$HOST:$RTMP_PORT/$STREAM_PATH
+  SRT     srt://$HOST:8890?streamid=read:$STREAM_PATH
+  HLS     http://$HOST:8888/$STREAM_PATH/
+  WebRTC  http://$HOST:8889/$STREAM_PATH/
+Press Ctrl+C to stop.
+EOF
+fi
+
+"${FFMPEG[@]}"
