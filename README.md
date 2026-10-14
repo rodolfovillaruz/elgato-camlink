@@ -23,7 +23,7 @@ Override with `RTMP_PORT=... ./camlink-stream serve`.
 
 The stream carries two audio tracks (Opus for WebRTC, AAC for RTMP); each protocol gets the
 one it supports. The server is powered by MediaMTX v1.21.2, which the script downloads into
-`mediamtx/` on first run (x86-64 Linux). It listens on all
+`mediamtx/` on first run (x86-64 or ARM Linux). It listens on all
 interfaces without authentication, so anyone on your LAN can watch. Add `authInternalUsers`
 in `mediamtx/mediamtx.yml` if that matters.
 
